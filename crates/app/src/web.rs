@@ -1,30 +1,33 @@
-//! Browser side: egui UI, AudioWorklet bootstrap, signaling WebSocket and the WebRTC data channel.
+//! Browser side: AudioWorklet bootstrap, shared clock wiring, signaling WebSocket and the WebRTC data channel.
+//! The egui UI lives in `ui.rs`.
 //! shortcut: event-handler closures are `forget()`-leaked (a few per connection); fine for an MVP.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use eframe::egui;
-use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
+use js_sys::{Array, ArrayBuffer, Function, Object, Reflect, Uint8Array};
 use protocol::Signal;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, MessageEvent, Response, RtcConfiguration,
-    RtcDataChannel, RtcDataChannelEvent, RtcDataChannelType, RtcIceCandidateInit, RtcIceConnectionState, RtcIceServer, RtcPeerConnection,
+    AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, MessageEvent, Response, RtcConfiguration, RtcDataChannel,
+    RtcDataChannelEvent, RtcDataChannelType, RtcIceCandidateInit, RtcIceConnectionState, RtcIceServer, RtcPeerConnection,
     RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, WebSocket,
 };
 
-use crate::model::{Pattern, PatternDoc, STEPS, TRACKS};
+use crate::clock::{self, ClockMsg, ClockSync};
+use crate::model::{Project, ProjectView};
 use crate::sync;
 
 const STUN: &str = "stun:stun.l.google.com:19302";
-const TRACK_NAMES: [&str; TRACKS] = ["Kick", "Snare", "Hat", "Bass"];
+const TICK_MS: i32 = 100;
+const TICKS_PER_SECOND: u32 = 10;
 
 type Slot<T> = Rc<RefCell<Option<T>>>;
 
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     web_sys::console::log_1(&msg.into());
 }
 
@@ -32,9 +35,16 @@ fn on<E: wasm_bindgen::convert::FromWasmAbi + 'static>(f: impl FnMut(E) + 'stati
     Closure::<dyn FnMut(E)>::new(f).into_js_value()
 }
 
-struct Audio {
+/// Local clock in ms, near-epoch so offsets between laptops stay small and readable.
+pub(crate) fn local_now() -> f64 {
+    let p = web_sys::window().unwrap().performance().unwrap();
+    p.time_origin() + p.now()
+}
+
+pub(crate) struct Audio {
+    ctx: AudioContext,
     node: AudioWorkletNode,
-    last_sent: Option<Pattern>,
+    last_state: Vec<u8>,
 }
 
 impl Audio {
@@ -44,39 +54,77 @@ impl Audio {
         }
     }
 
-    /// Sends the pattern to the worklet only when it changed.
-    fn push(&mut self, p: Pattern) {
-        if self.last_sent == Some(p) {
-            return;
+    /// Sends engine state bytes only when they changed.
+    fn push_state(&mut self, bytes: Vec<u8>) {
+        if bytes != self.last_state {
+            self.post(&Array::of2(&"state".into(), &Uint8Array::from(&bytes[..])));
+            self.last_state = bytes;
         }
-        let cells: Vec<u8> = p.cells.iter().flatten().map(|&c| c as u8).collect();
-        self.post(&Array::of3(&"pattern".into(), &p.bpm.into(), &Uint8Array::from(&cells[..])));
-        self.last_sent = Some(p);
     }
 
-    fn set_playing(&self, playing: bool) {
-        self.post(&Array::of2(&"play".into(), &(playing as u8).into()));
+    /// Maps an audio frame to shared time at the speakers (design D6). Positive nudge = hear it later.
+    fn post_anchor(&self, offset: f64, nudge_ms: f64) {
+        let ts = Reflect::get(&self.ctx, &"getOutputTimestamp".into())
+            .ok()
+            .and_then(|f| f.dyn_into::<Function>().ok())
+            .and_then(|f| f.call0(&self.ctx).ok());
+        let Some(ts) = ts else { return log("getOutputTimestamp unavailable") };
+        let get = |k: &str| Reflect::get(&ts, &k.into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let (context_time, performance_time) = (get("contextTime"), get("performanceTime"));
+        if context_time <= 0.0 {
+            return; // output not running yet
+        }
+        let origin = web_sys::window().unwrap().performance().unwrap().time_origin();
+        let frame = context_time * self.ctx.sample_rate() as f64;
+        let shared_ms = origin + performance_time + offset - nudge_ms;
+        self.post(&Array::of3(&"anchor".into(), &frame.into(), &shared_ms.into()));
     }
 }
 
 /// Handles shared by the UI and the async/network callbacks.
 #[derive(Clone)]
-struct Ctx {
-    doc: PatternDoc,
-    egui: egui::Context,
+pub(crate) struct Ctx {
+    pub project: Rc<Project>,
+    pub view: Rc<RefCell<ProjectView>>,
+    pub egui: egui::Context,
     ws: WebSocket,
     pc: Slot<RtcPeerConnection>,
     dc: Slot<RtcDataChannel>, // set only while open; local updates are broadcast through it
-    audio: Slot<Audio>,
-    step: Rc<Cell<i32>>,
-    status: Rc<RefCell<String>>,
+    pub audio: Slot<Audio>,
+    pub clock: Rc<RefCell<ClockSync>>,
+    pub status: Rc<RefCell<String>>,
+    dirty: Rc<Cell<bool>>,
+    fast_pings: Rc<Cell<u32>>,
+    pub nudge_ms: Rc<Cell<f64>>,
 }
 
 impl Ctx {
-    fn status(&self, s: &str) {
+    fn new(egui: egui::Context, ws: WebSocket) -> Self {
+        let project = Rc::new(Project::default());
+        Self {
+            clock: Rc::new(RefCell::new(ClockSync::new(project.client_id()))),
+            view: Rc::new(RefCell::new(project.view())),
+            project,
+            egui,
+            ws,
+            pc: Default::default(),
+            dc: Default::default(),
+            audio: Default::default(),
+            status: Rc::new(RefCell::new("connecting to signaling…".into())),
+            dirty: Rc::new(Cell::new(true)),
+            fast_pings: Rc::new(Cell::new(0)),
+            nudge_ms: Rc::new(Cell::new(0.0)),
+        }
+    }
+
+    pub fn status(&self, s: &str) {
         log(&format!("status: {s}"));
         *self.status.borrow_mut() = s.to_owned();
         self.egui.request_repaint();
+    }
+
+    pub fn shared_now(&self) -> f64 {
+        self.clock.borrow().shared(local_now())
     }
 
     fn send(&self, s: Signal) {
@@ -85,12 +133,49 @@ impl Ctx {
         }
     }
 
-    /// Remote changes also go straight to the engine, so a hidden tab (no repaints) still hears them.
-    fn after_remote_change(&self) {
-        if let Some(a) = self.audio.borrow_mut().as_mut() {
-            a.push(self.doc.snapshot());
+    /// Rebuilds the view and pushes engine state if the document changed since the last flush.
+    /// Returns whether anything changed.
+    pub fn flush(&self) -> bool {
+        if !self.dirty.replace(false) {
+            return false;
         }
+        let view = self.project.view();
+        if let Some(a) = self.audio.borrow_mut().as_mut() {
+            a.push_state(dsp::state::encode(&view.engine_state()));
+        }
+        *self.view.borrow_mut() = view;
+        true
+    }
+
+    /// Remote changes are flushed right away so a hidden tab (no repaints) still hears them.
+    fn after_remote_change(&self) {
+        self.flush();
         self.egui.request_repaint();
+    }
+
+    pub fn post_anchor(&self) {
+        if let Some(a) = self.audio.borrow().as_ref() {
+            a.post_anchor(self.clock.borrow().offset(), self.nudge_ms.get());
+        }
+    }
+
+    fn tick(&self, n: u32, last_offset: &Cell<f64>) {
+        let dc = self.dc.borrow().clone();
+        if let Some(dc) = dc {
+            let fast = self.fast_pings.get();
+            if fast > 0 || n.is_multiple_of(TICKS_PER_SECOND) {
+                self.fast_pings.set(fast.saturating_sub(1));
+                let _ = dc.send_with_u8_array(&clock::ping(local_now(), self.project.client_id()));
+            }
+        }
+        let offset = self.clock.borrow().offset();
+        if n.is_multiple_of(TICKS_PER_SECOND) || (offset - last_offset.get()).abs() > 0.5 {
+            if (offset - last_offset.get()).abs() > 0.5 {
+                log(&format!("clock: offset {offset:.1} ms to reference"));
+            }
+            last_offset.set(offset);
+            self.post_anchor();
+        }
     }
 }
 
@@ -103,7 +188,11 @@ pub fn start() {
             .and_then(|c| c.dyn_into().ok())
             .expect("index.html has <canvas id=canvas>");
         let created = eframe::WebRunner::new()
-            .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, room)))))
+            .start(
+                canvas,
+                eframe::WebOptions::default(),
+                Box::new(move |cc| Ok(Box::new(crate::ui::App::new(connect(cc.egui_ctx.clone(), &room), room)))),
+            )
             .await;
         if let Err(e) = created {
             log(&format!("eframe failed to start: {e:?}"));
@@ -130,54 +219,49 @@ fn room_from_url() -> String {
     room
 }
 
-struct App {
-    c: Ctx,
-    room: String,
-    playing: bool,
-}
+/// Opens signaling, wires the doc observers and starts the 100 ms clock/anchor tick.
+fn connect(egui: egui::Context, room: &str) -> Ctx {
+    let loc = web_sys::window().unwrap().location();
+    let scheme = if loc.protocol().as_deref() == Ok("https:") { "wss" } else { "ws" };
+    let ws = WebSocket::new(&format!("{scheme}://{}/ws?room={room}", loc.host().unwrap())).expect("websocket");
+    let c = Ctx::new(egui, ws);
 
-impl App {
-    fn new(cc: &eframe::CreationContext<'_>, room: String) -> Self {
-        let loc = web_sys::window().unwrap().location();
-        let scheme = if loc.protocol().as_deref() == Ok("https:") { "wss" } else { "ws" };
-        let ws = WebSocket::new(&format!("{scheme}://{}/ws?room={room}", loc.host().unwrap())).expect("websocket");
-        let c = Ctx {
-            doc: PatternDoc::default(),
-            egui: cc.egui_ctx.clone(),
-            ws,
-            pc: Default::default(),
-            dc: Default::default(),
-            audio: Default::default(),
-            step: Rc::new(Cell::new(-1)),
-            status: Rc::new(RefCell::new("connecting to signaling…".into())),
-        };
+    let (dc, dirty) = (c.dc.clone(), c.dirty.clone());
+    c.project
+        .doc
+        .observe_update_v1("net", move |txn, e| {
+            dirty.set(true); // local and remote: the engine state may have changed
+            if sync::is_remote(txn) {
+                return;
+            }
+            if let Some(dc) = dc.borrow().as_ref() {
+                let _ = dc.send_with_u8_array(&sync::update(&e.update));
+            }
+        })
+        .expect("observer registers on a fresh doc");
 
-        let dc = c.dc.clone();
-        c.doc
-            .doc
-            .observe_update_v1("net", move |txn, e| {
-                if sync::is_remote(txn) {
-                    return;
-                }
-                if let Some(dc) = dc.borrow().as_ref() {
-                    let _ = dc.send_with_u8_array(&sync::update(&e.update));
-                }
-            })
-            .expect("observer registers on a fresh doc");
+    let ctx = c.clone();
+    c.ws.set_onmessage(Some(
+        on(move |e: MessageEvent| match e.data().as_string().map(|t| serde_json::from_str(&t)) {
+            Some(Ok(sig)) => on_signal(&ctx, sig),
+            other => log(&format!("bad signaling message: {other:?}")),
+        })
+        .unchecked_ref(),
+    ));
+    let ctx = c.clone();
+    c.ws.set_onclose(Some(on(move |_: web_sys::Event| ctx.status("signaling disconnected — reload")).unchecked_ref()));
 
-        let ctx = c.clone();
-        c.ws.set_onmessage(Some(
-            on(move |e: MessageEvent| match e.data().as_string().map(|t| serde_json::from_str(&t)) {
-                Some(Ok(sig)) => on_signal(&ctx, sig),
-                other => log(&format!("bad signaling message: {other:?}")),
-            })
-            .unchecked_ref(),
-        ));
-        let ctx = c.clone();
-        c.ws.set_onclose(Some(on(move |_: web_sys::Event| ctx.status("signaling disconnected — reload")).unchecked_ref()));
-
-        Self { c, room, playing: false }
-    }
+    let (ctx, n, last_offset) = (c.clone(), Cell::new(0u32), Cell::new(0.0));
+    let tick = Closure::<dyn FnMut()>::new(move || {
+        n.set(n.get().wrapping_add(1));
+        ctx.tick(n.get(), &last_offset);
+    });
+    web_sys::window()
+        .unwrap()
+        .set_interval_with_callback_and_timeout_and_arguments_0(tick.as_ref().unchecked_ref(), TICK_MS)
+        .expect("setInterval");
+    tick.forget();
+    c
 }
 
 fn on_signal(ctx: &Ctx, sig: Signal) {
@@ -219,10 +303,11 @@ fn on_signal(ctx: &Ctx, sig: Signal) {
         }
         Signal::PeerLeft => {
             ctx.dc.replace(None);
+            ctx.clock.borrow_mut().peer_left();
             if let Some(pc) = ctx.pc.replace(None) {
                 pc.close();
             }
-            ctx.status("peer left — keep editing, changes merge when they rejoin");
+            ctx.status("peer left — keep jamming, changes merge when they rejoin");
         }
         Signal::RoomFull => ctx.status("room is full (max 2 peers)"),
     }
@@ -310,7 +395,8 @@ fn setup_channel(ctx: &Ctx, dc: RtcDataChannel) {
     dc.set_onopen(Some(
         on(move |_: web_sys::Event| {
             c.dc.replace(Some(ch.clone()));
-            let _ = ch.send_with_u8_array(&sync::sync_step1(&c.doc.doc));
+            let _ = ch.send_with_u8_array(&sync::sync_step1(&c.project.doc));
+            c.fast_pings.set(5); // quick clock convergence, then once a second
             c.status("connected peer-to-peer");
         })
         .unchecked_ref(),
@@ -322,7 +408,19 @@ fn setup_channel(ctx: &Ctx, dc: RtcDataChannel) {
             let Ok(buf) = e.data().dyn_into::<ArrayBuffer>() else {
                 return log("ignoring non-binary data channel message");
             };
-            match sync::handle(&c.doc.doc, &Uint8Array::new(&buf).to_vec()) {
+            let bytes = Uint8Array::new(&buf).to_vec();
+            if clock::is_clock(&bytes) {
+                match clock::decode(&bytes) {
+                    Ok(ClockMsg::Ping { t0, client_id }) => {
+                        c.clock.borrow_mut().on_ping(client_id);
+                        let _ = ch.send_with_u8_array(&clock::pong(t0, c.shared_now()));
+                    }
+                    Ok(ClockMsg::Pong { t0, t1 }) => c.clock.borrow_mut().on_pong(t0, t1, local_now()),
+                    Err(e) => log(&e),
+                }
+                return;
+            }
+            match sync::handle(&c.project.doc, &bytes) {
                 Ok(Some(reply)) => {
                     let _ = ch.send_with_u8_array(&reply);
                 }
@@ -337,6 +435,7 @@ fn setup_channel(ctx: &Ctx, dc: RtcDataChannel) {
     dc.set_onclose(Some(
         on(move |_: web_sys::Event| {
             c.dc.replace(None);
+            c.clock.borrow_mut().peer_left();
             c.status("peer disconnected — waiting for them to rejoin");
         })
         .unchecked_ref(),
@@ -344,7 +443,7 @@ fn setup_channel(ctx: &Ctx, dc: RtcDataChannel) {
 }
 
 /// Must run after a user click: browsers only allow audio to start from a gesture.
-async fn start_audio(ctx: Ctx) -> Result<(), JsValue> {
+pub(crate) async fn start_audio(ctx: Ctx) -> Result<(), JsValue> {
     let ac = AudioContext::new()?;
     let window = web_sys::window().unwrap();
     let res: Response = JsFuture::from(window.fetch_with_str("dsp.wasm")).await?.dyn_into()?;
@@ -360,86 +459,12 @@ async fn start_audio(ctx: Ctx) -> Result<(), JsValue> {
     opts.set_processor_options(Some(&processor_options));
     let node = AudioWorkletNode::new_with_options(&ac, "dsp", &opts)?;
     node.connect_with_audio_node(&ac.destination())?;
-
-    let c = ctx.clone();
-    node.port()?.set_onmessage(Some(
-        on(move |e: MessageEvent| {
-            c.step.set(e.data().as_f64().unwrap_or(-1.0) as i32);
-            c.egui.request_repaint();
-        })
-        .unchecked_ref(),
-    ));
     JsFuture::from(ac.resume()?).await?;
 
-    let mut audio = Audio { node, last_sent: None };
-    audio.push(ctx.doc.snapshot());
-    ctx.audio.replace(Some(audio));
-    std::mem::forget(ac); // lives for the page's lifetime
+    ctx.audio.replace(Some(Audio { ctx: ac, node, last_state: Vec::new() }));
+    ctx.dirty.set(true); // push the current state to the fresh engine
+    ctx.flush();
+    ctx.post_anchor();
     ctx.egui.request_repaint();
     Ok(())
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let c = &self.c;
-        let audio_ready = c.audio.borrow().is_some();
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            ui.heading("P2P Sequencer");
-            ui.label(format!("Room {} · {}", self.room, c.status.borrow()));
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                if !audio_ready {
-                    if ui.button("▶ Start audio").clicked() {
-                        let c = c.clone();
-                        spawn_local(async move {
-                            if let Err(e) = start_audio(c.clone()).await {
-                                log(&format!("audio failed: {e:?}"));
-                                c.status("audio failed to start (see console)");
-                            }
-                        });
-                    }
-                } else if ui.button(if self.playing { "■ Stop" } else { "▶ Play" }).clicked() {
-                    self.playing = !self.playing;
-                    if let Some(a) = c.audio.borrow().as_ref() {
-                        a.set_playing(self.playing);
-                    }
-                }
-                let mut bpm = c.doc.snapshot().bpm;
-                if ui.add(egui::DragValue::new(&mut bpm).range(40.0..=240.0).suffix(" BPM")).changed() {
-                    c.doc.set_bpm(bpm.round());
-                }
-            });
-            ui.add_space(8.0);
-
-            let p = c.doc.snapshot();
-            let playhead = if self.playing { c.step.get() } else { -1 };
-            egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
-                for (t, name) in TRACK_NAMES.iter().enumerate() {
-                    ui.label(*name);
-                    for s in 0..STEPS {
-                        let on = p.cells[t][s];
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
-                        let fill = match (on, s % 4 == 0) {
-                            (true, _) => egui::Color32::from_rgb(255, 140, 40),
-                            (false, true) => egui::Color32::from_gray(70),
-                            (false, false) => egui::Color32::from_gray(50),
-                        };
-                        ui.painter().rect_filled(rect, 4.0, fill);
-                        if s as i32 == playhead {
-                            let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-                            ui.painter().rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
-                        }
-                        if resp.clicked() {
-                            c.doc.set_cell(t, s, !on);
-                        }
-                    }
-                    ui.end_row();
-                }
-            });
-        });
-        if let Some(a) = c.audio.borrow_mut().as_mut() {
-            a.push(c.doc.snapshot());
-        }
-    }
 }
