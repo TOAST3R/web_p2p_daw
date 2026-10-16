@@ -1,0 +1,5 @@
+# dsp.wasm is a separate raw module for the AudioWorklet; build it before trunk copies it.
+[[hooks]]
+stage = "pre_build"
+command = "cargo"
+command_arguments = ["build", "-p", "dsp", "--release", "--target", "wasm32-unknown-unknown"]
