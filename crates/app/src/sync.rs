@@ -52,12 +52,12 @@ pub fn handle(doc: &Doc, msg: &[u8]) -> Result<Option<Vec<u8>>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::PatternDoc;
+    use crate::model::{Kind, Project};
     use std::sync::{Arc, Mutex};
 
     /// A peer whose broadcast Updates land in `outbox`, like the data channel would.
-    fn peer() -> (PatternDoc, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let d = PatternDoc::default();
+    fn peer() -> (Project, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let d = Project::default();
         let outbox = Arc::new(Mutex::new(Vec::new()));
         let o = outbox.clone();
         d.doc
@@ -87,17 +87,17 @@ mod tests {
     fn late_joiner_and_offline_edits_converge() {
         let (a, out_a) = peer();
         let (b, out_b) = peer();
-        a.set_cell(0, 0, true);
-        a.set_bpm(100.0);
-        b.set_cell(3, 15, true);
+        let ta = a.add_track(Kind::Synth);
+        a.set_bpm(100.0, 0.0);
+        let tb = b.add_track(Kind::Drums);
         out_a.lock().unwrap().clear(); // not connected yet: these were never sent
         out_b.lock().unwrap().clear();
 
         handshake(&a.doc, &b.doc);
-        assert_eq!(a.snapshot(), b.snapshot());
-        let p = a.snapshot();
-        assert!(p.cells[0][0] && p.cells[3][15]);
-        assert_eq!(p.bpm, 100.0);
+        assert_eq!(a.view(), b.view());
+        let p = a.view();
+        assert!(p.track(&ta).is_some() && p.track(&tb).is_some());
+        assert_eq!(p.transport.bpm, 100.0);
         assert!(out_a.lock().unwrap().is_empty(), "applying remote state is not echoed");
         assert!(out_b.lock().unwrap().is_empty(), "applying remote state is not echoed");
     }
@@ -108,16 +108,16 @@ mod tests {
         let (b, out_b) = peer();
         handshake(&a.doc, &b.doc);
 
-        a.set_cell(1, 4, true);
+        let t = a.add_track(Kind::Synth);
         deliver(&out_a, &b.doc);
-        assert!(b.snapshot().cells[1][4]);
+        assert!(b.view().track(&t).is_some());
         assert!(out_b.lock().unwrap().is_empty(), "no echo");
 
-        a.set_cell(2, 2, true); // concurrent: neither has seen the other's write
-        b.set_cell(2, 2, false);
+        a.set_volume(&t, 0.2); // concurrent: neither has seen the other's write
+        b.set_volume(&t, 0.9);
         deliver(&out_a, &b.doc);
         deliver(&out_b, &a.doc);
-        assert_eq!(a.snapshot(), b.snapshot());
+        assert_eq!(a.view(), b.view());
     }
 
     #[test]
